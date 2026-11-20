@@ -1,79 +1,128 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Vice Tide — deterministic screenshot scenes for ?shot=<name>&seed=<n>.
+// Each scene arranges a real gameplay state (the same entities, physics
+// and HUD as normal play) and installs a small autopilot that drives the
+// car along one block of Port Solano, so the maker's captures are honest
+// renders of the game running, taken the same way every time.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { clamp, distance, angleTo, angleDelta } from './random.js';
+import { STORY_MISSIONS } from './missions.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
+// Drive a loop of waypoints around one city block forever.
+function installBlockDriver(game, waypoints, cruiseSpeed) {
+  let index = 0;
+  game.input.autopilot = (g, control) => {
+    const car = g.player.car;
+    if (!car) return;
+    let target = waypoints[index];
+    if (distance(car.x, car.y, target.x, target.y) < 100) {
+      index = (index + 1) % waypoints.length;
+      target = waypoints[index];
     }
-  }
-  return Infinity;
+    const want = angleTo(car.x, car.y, target.x, target.y);
+    const turn = angleDelta(car.angle, want);
+    control.steer = clamp(turn * 1.9, -1, 1);
+    control.throttle = car.speed < cruiseSpeed ? 1 : 0;
+    control.reverse = false;
+    control.handbrake = false;
+    control.shoot = false;
+  };
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+const BLOCK_LOOP = [
+  { x: 1423, y: 1000 },
+  { x: 1350, y: 880 },
+  { x: 1050, y: 877 },
+  { x: 977, y: 1000 },
+  { x: 977, y: 1450 },
+  { x: 1050, y: 1523 },
+  { x: 1350, y: 1523 },
+  { x: 1423, y: 1450 },
+];
+
+// Put the player behind the wheel of a car at a chosen place and speed.
+function seatPlayerInCar(game, x, y, angle, speed, kind) {
+  let car = game.traffic.cars.find((c) => !c.parked && c.driver === 'traffic' && (!kind || c.type.kind === kind));
+  if (!car) car = game.traffic.cars[0];
+  car.x = x;
+  car.y = y;
+  car.angle = angle;
+  car.speed = speed;
+  car.driver = 'player';
+  car.parked = false;
+  car.enteredAtStep = 0;
+  game.player.car = car;
+  game.player.x = x;
+  game.player.y = y;
+  return car;
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+// Bring a few traffic cars near a point so the street feels alive.
+function gatherTraffic(game, x, y) {
+  let placed = 0;
+  for (const car of game.traffic.cars) {
+    if (car.driver !== 'traffic' || placed >= 4) continue;
+    car.x = x + (placed % 2 === 0 ? -23 : 23);
+    car.y = y - 260 + placed * 170;
+    car.angle = placed % 2 === 0 ? Math.PI / 2 : -Math.PI / 2;
+    car.roadVertical = true;
+    car.roadLine = 1400;
+    car.speed = car.aiSpeed;
+    placed += 1;
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+}
+
+export function setupShotScene(game, name, seed) {
+  game.player.cash = 640;
+  game.clockMinutes = 10 * 60 + 24;
+  game.day = 3;
+  game.respect = 2;
+
+  if (name === 'start') {
+    game.mode = 'title';
+    game.titleSelection = 0;
+    game.showHelp = false;
+    return;
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  if (name === 'drive') {
+    seatPlayerInCar(game, 1423, 1420, -Math.PI / 2, 215, 'sedan');
+    gatherTraffic(game, 1400, 1300);
+    installBlockDriver(game, BLOCK_LOOP, 235);
+    return;
+  }
+
+  if (name === 'chase') {
+    const car = seatPlayerInCar(game, 1423, 1420, -Math.PI / 2, 265, 'sport');
+    gatherTraffic(game, 1400, 1500);
+    // Three stars, with two cruisers already on the tail so the chase
+    // reads in the frame the moment the maker takes the shot.
+    game.police.heat = 300;
+    game.police.syncCruisers(game);
+    game.police.cruisers.forEach((cruiser, i) => {
+      cruiser.x = 1400 + (i % 2 === 0 ? -16 : 30);
+      cruiser.y = 1420 + 130 + i * 95;
+      cruiser.angle = -Math.PI / 2;
+      cruiser.speed = 255;
+    });
+    game.combat.burst(car.x, car.y - 20, 8, '#e8e8e8', 90, 0.5);
+    installBlockDriver(game, BLOCK_LOOP, 245);
+    return;
+  }
+
+  if (name === 'mission') {
+    // Standing with Mara at the safehouse, her first job on the table:
+    // the dialogue box open, the gold marker overhead, the city around.
+    game.storyIndex = 0;
+    game.player.x = 1446;
+    game.player.y = 1692;
+    game.player.angle = Math.atan2(1660 - 1692, 1480 - 1446);
+    game.ensureGiverPed();
+    const mission = STORY_MISSIONS[0];
+    game.missions.showDialogue(mission.intro, null);
+    return;
+  }
+
+  // Unknown scene name: fall back to a calm drive.
+  seatPlayerInCar(game, 1423, 1420, -Math.PI / 2, 180, 'sedan');
+  installBlockDriver(game, BLOCK_LOOP, 200);
 }
